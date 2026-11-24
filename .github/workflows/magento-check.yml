@@ -1,0 +1,88 @@
+name: Magento Check
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: magento-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: Version matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        uses: lbajsarowicz/github-action-magento-matrix@4408bf7e120052a67a2ae21ce25344eedb2d3d33 # v1.0.1
+
+  integration:
+    name: "Magento ${{ matrix.magento }} @ PHP ${{ matrix.php }}"
+    needs: matrix
+    # ElasticSearch fails to start on ubuntu-24.04.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+    container:
+      image: extdn/magento-integration-tests-action:${{ matrix.php }}-latest # zizmor: ignore[unpinned-images] the PHP version follows the matrix
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        options: --tmpfs /tmp:rw --tmpfs /var/lib/mysql:rw --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+      es:
+        image: docker.io/wardenenv/elasticsearch:${{ (startsWith(matrix.magento, '2.4.8') || startsWith(matrix.magento, '2.4.9')) && '8.1' || '7.8' }} # zizmor: ignore[unpinned-images] the search engine follows the matrix
+        env:
+          'discovery.type': single-node
+          'xpack.security.enabled': false
+          ES_JAVA_OPTS: "-Xms64m -Xmx512m"
+        options: --health-cmd="curl localhost:9200/_cluster/health?wait_for_status=yellow&timeout=60s" --health-interval=10s --health-timeout=5s --health-retries=3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The job runs inside the image of extdn/github-actions-m2/magento-integration-tests,
+      # because a `uses:` reference cannot follow the matrix PHP version.
+      - name: Integration tests
+        id: integration
+        run: bash /entrypoint.sh
+        env:
+          INPUT_MODULE_NAME: IMI_FriendlyCaptcha
+          INPUT_COMPOSER_NAME: imi/magento2-friendly-captcha
+          INPUT_MAGENTO_VERSION: ${{ matrix.magento }}
+          COMPOSER_MEMORY_LIMIT: -1
+      - name: Compile and deploy static content
+        if: ${{ !cancelled() }}
+        working-directory: /var/www/magento2ce
+        run: |
+          php -d memory_limit=-1 bin/magento setup:di:compile
+          php -d memory_limit=-1 bin/magento setup:static-content:deploy -f
+
+  result:
+    name: Result
+    if: ${{ always() }}
+    needs: [matrix, integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail unless every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Jobs: $RESULTS"
+          [[ ! "$RESULTS" =~ (failure|cancelled|skipped) ]]
